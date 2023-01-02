@@ -1,4 +1,4 @@
-module github.com/WiseOwlTech/go-rate-limiter
+module github.com/jsjain/go-rate-limiter
 
 go 1.19
 
