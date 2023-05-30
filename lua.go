@@ -1,7 +1,7 @@
 package rate_limiter
 
 import (
-	"github.com/rueian/rueidis"
+	"github.com/redis/rueidis"
 )
 
 // Copyright (c) 2017 Pavel Pravosud

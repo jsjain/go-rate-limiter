@@ -1,5 +1,5 @@
 module github.com/jsjain/go-rate-limiter
 
-go 1.19
+go 1.20
 
-require github.com/rueian/rueidis v0.0.90
+require github.com/redis/rueidis v1.0.6

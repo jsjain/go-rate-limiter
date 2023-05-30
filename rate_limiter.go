@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/rueian/rueidis"
+	"github.com/redis/rueidis"
 )
 
 const redisPrefix = "rl:"
