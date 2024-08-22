@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/alphadose/haxmap"
 	"github.com/redis/rueidis"
 )
 
@@ -73,14 +74,32 @@ func PerDay(rate int) Limit {
 
 // Limiter controls how frequently events are allowed to happen.
 type Limiter struct {
-	rdb rueidis.Client
+	rdb          rueidis.Client
+	customLimits *haxmap.Map[string, Limit]
+}
+
+type LimiterOption func(*Limiter)
+
+func WithCustomLimits(limits *haxmap.Map[string, Limit]) LimiterOption {
+	return func(l *Limiter) {
+		l.customLimits = limits
+	}
 }
 
 // NewLimiter returns a new Limiter.
-func NewLimiter(rdb rueidis.Client) *Limiter {
-	return &Limiter{
+func NewLimiter(rdb rueidis.Client, opts ...LimiterOption) *Limiter {
+	limiter := &Limiter{
 		rdb: rdb,
 	}
+	for _, opt := range opts {
+		opt(limiter)
+	}
+
+	if limiter.customLimits == nil {
+		limiter.customLimits = haxmap.New[string, Limit]()
+	}
+
+	return limiter
 }
 
 // Allow is a shortcut for AllowN(ctx, key, limit, 1).
@@ -95,6 +114,9 @@ func (l Limiter) AllowN(
 	limit Limit,
 	n int,
 ) (*Result, error) {
+	if cl, ok := l.customLimits.Get(key); ok {
+		limit = cl
+	}
 	values := []string{strconv.Itoa(limit.Burst),
 		strconv.Itoa(limit.Rate),
 		strconv.FormatFloat(limit.Period.Seconds(), 'f', 2, 32),
