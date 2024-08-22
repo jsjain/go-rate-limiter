@@ -75,6 +75,7 @@ func PerDay(rate int) Limit {
 // Limiter controls how frequently events are allowed to happen.
 type Limiter struct {
 	rdb          rueidis.Client
+	limit        Limit
 	customLimits *haxmap.Map[string, Limit]
 }
 
@@ -86,10 +87,25 @@ func WithCustomLimits(limits *haxmap.Map[string, Limit]) LimiterOption {
 	}
 }
 
+func WithRateLimit(limit Limit) LimiterOption {
+	return func(l *Limiter) {
+		l.limit = limit
+	}
+}
+
+func defaultLimits() Limit {
+	return Limit{
+		Burst:  1,
+		Rate:   1,
+		Period: time.Second,
+	}
+}
+
 // NewLimiter returns a new Limiter.
 func NewLimiter(rdb rueidis.Client, opts ...LimiterOption) *Limiter {
 	limiter := &Limiter{
-		rdb: rdb,
+		rdb:   rdb,
+		limit: defaultLimits(),
 	}
 	for _, opt := range opts {
 		opt(limiter)
@@ -103,17 +119,17 @@ func NewLimiter(rdb rueidis.Client, opts ...LimiterOption) *Limiter {
 }
 
 // Allow is a shortcut for AllowN(ctx, key, limit, 1).
-func (l Limiter) Allow(ctx context.Context, key string, limit Limit) (*Result, error) {
-	return l.AllowN(ctx, key, limit, 1)
+func (l Limiter) Allow(ctx context.Context, key string) (*Result, error) {
+	return l.AllowN(ctx, key, 1)
 }
 
 // AllowN reports whether n events may happen at time now.
 func (l Limiter) AllowN(
 	ctx context.Context,
 	key string,
-	limit Limit,
 	n int,
 ) (*Result, error) {
+	limit := l.limit
 	if cl, ok := l.customLimits.Get(key); ok {
 		limit = cl
 	}
