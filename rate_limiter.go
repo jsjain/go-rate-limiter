@@ -77,6 +77,7 @@ type Limiter struct {
 	rdb          rueidis.Client
 	limit        Limit
 	customLimits *haxmap.Map[string, Limit]
+	prefix       string
 }
 
 type LimiterOption func(*Limiter)
@@ -93,6 +94,12 @@ func WithRateLimit(limit Limit) LimiterOption {
 	}
 }
 
+func WithPrefix(prefix string) LimiterOption {
+	return func(l *Limiter) {
+		l.prefix = prefix
+	}
+}
+
 func defaultLimits() Limit {
 	return Limit{
 		Burst:  1,
@@ -104,8 +111,9 @@ func defaultLimits() Limit {
 // NewLimiter returns a new Limiter.
 func NewLimiter(rdb rueidis.Client, opts ...LimiterOption) *Limiter {
 	limiter := &Limiter{
-		rdb:   rdb,
-		limit: defaultLimits(),
+		rdb:    rdb,
+		limit:  defaultLimits(),
+		prefix: redisPrefix,
 	}
 	for _, opt := range opts {
 		opt(limiter)
