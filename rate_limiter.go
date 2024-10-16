@@ -145,7 +145,7 @@ func (l Limiter) AllowN(
 		strconv.Itoa(limit.Rate),
 		strconv.FormatFloat(limit.Period.Seconds(), 'f', 2, 32),
 		strconv.Itoa(n)}
-	result, err := allowN.Exec(ctx, l.rdb, []string{redisPrefix + key}, values).AsFloatSlice()
+	result, err := allowN.Exec(ctx, l.rdb, []string{l.prefix + key}, values).AsFloatSlice()
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +174,7 @@ func (l Limiter) AllowAtMost(
 		strconv.Itoa(limit.Rate),
 		strconv.FormatFloat(limit.Period.Seconds(), 'f', 2, 32),
 		strconv.Itoa(n)}
-	result, err := allowAtMost.Exec(ctx, l.rdb, []string{redisPrefix + key}, values).AsFloatSlice()
+	result, err := allowAtMost.Exec(ctx, l.rdb, []string{l.prefix + key}, values).AsFloatSlice()
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +194,7 @@ func (l Limiter) AllowAtMost(
 
 // Reset gets a key and reset all limitations and previous usages
 func (l *Limiter) Reset(ctx context.Context, key string) error {
-	cmd := l.rdb.B().Del().Key(redisPrefix + key).Build()
+	cmd := l.rdb.B().Del().Key(l.prefix + key).Build()
 	return l.rdb.Do(ctx, cmd).Error()
 }
 
