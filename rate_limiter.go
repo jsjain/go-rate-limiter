@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/alphadose/haxmap"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/redis/rueidis"
 )
 
@@ -72,25 +72,47 @@ func PerDay(rate int) Limit {
 
 //------------------------------------------------------------------------------
 
+// limitEntry caches the string-encoded fields of a Limit to avoid per-call
+// strconv allocations in the hot path.
+type limitEntry struct {
+	limit     Limit
+	burstStr  string
+	rateStr   string
+	periodStr string
+}
+
+func newLimitEntry(l Limit) limitEntry {
+	return limitEntry{
+		limit:     l,
+		burstStr:  strconv.Itoa(l.Burst),
+		rateStr:   strconv.Itoa(l.Rate),
+		periodStr: strconv.FormatFloat(l.Period.Seconds(), 'f', 2, 32),
+	}
+}
+
 // Limiter controls how frequently events are allowed to happen.
 type Limiter struct {
 	rdb          rueidis.Client
-	limit        Limit
-	customLimits *haxmap.Map[string, Limit]
+	limit        limitEntry
+	customLimits *xsync.Map[string, limitEntry]
 	prefix       string
 }
 
 type LimiterOption func(*Limiter)
 
-func WithCustomLimits(limits *haxmap.Map[string, Limit]) LimiterOption {
+// WithCustomLimits sets per-key rate limits. These are compiled once at
+// construction time, so per-call strconv overhead is avoided.
+func WithCustomLimits(limits map[string]Limit) LimiterOption {
 	return func(l *Limiter) {
-		l.customLimits = limits
+		for k, v := range limits {
+			l.customLimits.Store(k, newLimitEntry(v))
+		}
 	}
 }
 
 func WithRateLimit(limit Limit) LimiterOption {
 	return func(l *Limiter) {
-		l.limit = limit
+		l.limit = newLimitEntry(limit)
 	}
 }
 
@@ -111,19 +133,20 @@ func defaultLimits() Limit {
 // NewLimiter returns a new Limiter.
 func NewLimiter(rdb rueidis.Client, opts ...LimiterOption) *Limiter {
 	limiter := &Limiter{
-		rdb:    rdb,
-		limit:  defaultLimits(),
-		prefix: redisPrefix,
+		rdb:          rdb,
+		limit:        newLimitEntry(defaultLimits()),
+		prefix:       redisPrefix,
+		customLimits: xsync.NewMap[string, limitEntry](),
 	}
 	for _, opt := range opts {
 		opt(limiter)
 	}
-
-	if limiter.customLimits == nil {
-		limiter.customLimits = haxmap.New[string, Limit]()
-	}
-
 	return limiter
+}
+
+// SetCustomLimit adds or updates a per-key rate limit after construction.
+func (l *Limiter) SetCustomLimit(key string, limit Limit) {
+	l.customLimits.Store(key, newLimitEntry(limit))
 }
 
 // Allow is a shortcut for AllowN(ctx, key, limit, 1).
@@ -137,27 +160,22 @@ func (l Limiter) AllowN(
 	key string,
 	n int,
 ) (*Result, error) {
-	limit := l.limit
-	if cl, ok := l.customLimits.Get(key); ok {
-		limit = cl
+	entry := l.limit
+	if cl, ok := l.customLimits.Load(key); ok {
+		entry = cl
 	}
-	values := []string{strconv.Itoa(limit.Burst),
-		strconv.Itoa(limit.Rate),
-		strconv.FormatFloat(limit.Period.Seconds(), 'f', 2, 32),
-		strconv.Itoa(n)}
+	values := []string{entry.burstStr, entry.rateStr, entry.periodStr, strconv.Itoa(n)}
 	result, err := allowN.Exec(ctx, l.rdb, []string{l.prefix + key}, values).AsFloatSlice()
 	if err != nil {
 		return nil, err
 	}
 
-	retryAfter := result[2]
-	resetAfter := result[3]
 	res := &Result{
-		Limit:      limit,
+		Limit:      entry.limit,
 		Allowed:    int(result[0]),
 		Remaining:  int(result[1]),
-		RetryAfter: dur(retryAfter),
-		ResetAfter: dur(resetAfter),
+		RetryAfter: dur(result[2]),
+		ResetAfter: dur(result[3]),
 	}
 	return res, nil
 }
@@ -170,24 +188,19 @@ func (l Limiter) AllowAtMost(
 	limit Limit,
 	n int,
 ) (*Result, error) {
-	values := []string{strconv.Itoa(limit.Burst),
-		strconv.Itoa(limit.Rate),
-		strconv.FormatFloat(limit.Period.Seconds(), 'f', 2, 32),
-		strconv.Itoa(n)}
+	entry := newLimitEntry(limit)
+	values := []string{entry.burstStr, entry.rateStr, entry.periodStr, strconv.Itoa(n)}
 	result, err := allowAtMost.Exec(ctx, l.rdb, []string{l.prefix + key}, values).AsFloatSlice()
 	if err != nil {
 		return nil, err
 	}
 
-	retryAfter := result[2]
-	resetAfter := result[3]
-
 	res := &Result{
 		Limit:      limit,
 		Allowed:    int(result[0]),
 		Remaining:  int(result[1]),
-		RetryAfter: dur(retryAfter),
-		ResetAfter: dur(resetAfter),
+		RetryAfter: dur(result[2]),
+		ResetAfter: dur(result[3]),
 	}
 	return res, nil
 }
