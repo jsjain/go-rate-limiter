@@ -6,111 +6,79 @@ import (
 
 // Copyright (c) 2017 Pavel Pravosud
 // https://github.com/rwz/redis-gcra/blob/master/vendor/perform_gcra_ratelimit.lua
-var allowN = rueidis.NewLuaScript(`
+//
+// Both scripts work in whole microseconds rather than floating-point seconds.
+// Redis TIME has microsecond resolution, and a microsecond count measured from
+// the 2017 epoch stays well below 2^53, so every value here is an exact integer
+// in Lua's doubles and the arithmetic is exact.
+//
+// The original computed `now - ((tat + increment) - burst_offset)` in seconds,
+// subtracting two numbers of epoch magnitude. At ~2.9e8 seconds a float64's
+// spacing is ~6e-8, and that cancellation lost enough precision to turn a
+// remaining count of 9 into 8.999999976, which Redis truncated to 8 on the way
+// back: PerSecond(10) reported 9 available tokens as 8.
+//
+// The emission interval and burst offset arrive precomputed from Go, so the
+// script derives nothing per call, and every value it returns is an integer
+// count of microseconds rather than a formatted float.
+const luaPreamble = `
 -- this script has side-effects, so it requires replicate commands mode
 redis.replicate_commands()
 local rate_limit_key = KEYS[1]
-local burst = ARGV[1]
-local rate = ARGV[2]
-local period = ARGV[3]
-local cost = tonumber(ARGV[4])
-local emission_interval = period / rate
-local increment = emission_interval * cost
-local burst_offset = emission_interval * burst
--- redis returns time as an array containing two integers: seconds of the epoch
--- time (10 digits) and microseconds (6 digits). for convenience we need to
--- convert them to a floating point number. the resulting number is 16 digits,
--- bordering on the limits of a 64-bit double-precision floating point number.
--- adjust the epoch to be relative to Jan 1, 2017 00:00:00 GMT to avoid floating
--- point problems. this approach is good until "now" is 2,483,228,799 (Wed, 09
--- Sep 2048 01:46:39 GMT), when the adjusted value is 16 digits.
-local jan_1_2017 = 1483228800
-local now = redis.call("TIME")
-now = (now[1] - jan_1_2017) + (now[2] / 1000000)
+local emission_interval = tonumber(ARGV[1]) -- microseconds per event
+local burst_offset = tonumber(ARGV[2])      -- emission_interval * burst
+local cost = tonumber(ARGV[3])
+
+-- Redis returns time as two integers: epoch seconds and microseconds. Measuring
+-- from Jan 1 2017 keeps the microsecond count near 2.9e14, far below the 2^53
+-- limit for exact integers in a double. That holds past the year 2200.
+local t = redis.call("TIME")
+local now = (t[1] - 1483228800) * 1000000 + tonumber(t[2])
+
 local tat = redis.call("GET", rate_limit_key)
 if not tat then
   tat = now
 else
   tat = tonumber(tat)
 end
-tat = math.max(tat, now)
-local new_tat = tat + increment
-local allow_at = new_tat - burst_offset
-local diff = now - allow_at
-local remaining = diff / emission_interval
-if remaining < 0 then
-  local reset_after = tat - now
-  local retry_after = diff * -1
-  return {
-    0, -- allowed
-    0, -- remaining
-    tostring(retry_after),
-    tostring(reset_after),
-  }
+if tat < now then
+  tat = now
+end
+`
+
+// Returned values are microseconds; retry_after is -1 when the request was
+// allowed.
+var allowN = rueidis.NewLuaScript(luaPreamble + `
+local new_tat = tat + emission_interval * cost
+local diff = now - (new_tat - burst_offset)
+if diff < 0 then
+  return {0, 0, -diff, tat - now}
 end
 local reset_after = new_tat - now
 if reset_after > 0 then
-  redis.call("SET", rate_limit_key, new_tat, "EX", math.ceil(reset_after))
+  redis.call("SET", rate_limit_key, new_tat, "EX", math.ceil(reset_after / 1000000))
 end
-local retry_after = -1
-return {cost, remaining, tostring(retry_after), tostring(reset_after)}
+return {cost, math.floor(diff / emission_interval), -1, reset_after}
 `)
 
-var allowAtMost = rueidis.NewLuaScript(`
--- this script has side-effects, so it requires replicate commands mode
-redis.replicate_commands()
-local rate_limit_key = KEYS[1]
-local burst = ARGV[1]
-local rate = ARGV[2]
-local period = ARGV[3]
-local cost = tonumber(ARGV[4])
-local emission_interval = period / rate
-local burst_offset = emission_interval * burst
--- redis returns time as an array containing two integers: seconds of the epoch
--- time (10 digits) and microseconds (6 digits). for convenience we need to
--- convert them to a floating point number. the resulting number is 16 digits,
--- bordering on the limits of a 64-bit double-precision floating point number.
--- adjust the epoch to be relative to Jan 1, 2017 00:00:00 GMT to avoid floating
--- point problems. this approach is good until "now" is 2,483,228,799 (Wed, 09
--- Sep 2048 01:46:39 GMT), when the adjusted value is 16 digits.
-local jan_1_2017 = 1483228800
-local now = redis.call("TIME")
-now = (now[1] - jan_1_2017) + (now[2] / 1000000)
-local tat = redis.call("GET", rate_limit_key)
-if not tat then
-  tat = now
-else
-  tat = tonumber(tat)
-end
-tat = math.max(tat, now)
+var allowAtMost = rueidis.NewLuaScript(luaPreamble + `
 local diff = now - (tat - burst_offset)
-local remaining = diff / emission_interval
+local remaining = math.floor(diff / emission_interval)
 if remaining < 1 then
-  local reset_after = tat - now
-  local retry_after = emission_interval - diff
-  return {
-    0, -- allowed
-    0, -- remaining
-    tostring(retry_after),
-    tostring(reset_after),
-  }
+  return {0, 0, emission_interval - diff, tat - now}
 end
 if remaining < cost then
+  -- diff and emission_interval are exact integers, so the quotient is
+  -- integer-valued and this assignment charges exactly what is reported.
   cost = remaining
   remaining = 0
 else
   remaining = remaining - cost
 end
-local increment = emission_interval * cost
-local new_tat = tat + increment
+local new_tat = tat + emission_interval * cost
 local reset_after = new_tat - now
 if reset_after > 0 then
-  redis.call("SET", rate_limit_key, new_tat, "EX", math.ceil(reset_after))
+  redis.call("SET", rate_limit_key, new_tat, "EX", math.ceil(reset_after / 1000000))
 end
-return {
-  cost,
-  remaining,
-  tostring(-1),
-  tostring(reset_after),
-}
+return {cost, remaining, -1, reset_after}
 `)

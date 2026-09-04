@@ -2,7 +2,10 @@ package rate_limiter
 
 import (
 	"context"
+	"math/rand"
+	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -543,48 +546,104 @@ func TestNegativeCountRejected(t *testing.T) {
 	}
 }
 
-// The Lua script computes `remaining` in floating point, so a limit whose
-// emission interval is not exactly representable loses a token in the report:
-// PerSecond(10) makes Lua evaluate 0.9/0.1 as 8.999999999999998, which Redis
-// truncates to 8. The in-memory backend uses integer nanoseconds and reports
-// the exact 9.
-//
-// This predates the in-memory backend and affects only the reported Remaining,
-// not the admit/deny decision. The test pins it so the difference is a known
-// quantity rather than a surprise.
-func TestKnownDivergence_RedisFloatLosesAToken(t *testing.T) {
+// PerSecond(10) is the case that used to expose the Lua script's float error:
+// it computed the remaining count as 8.999999976, which Redis truncated to 8
+// where the exact answer is 9. Both backends now work in exact integers.
+func TestParity_PerSecondRemainingIsExact(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(t)
 
-	limit := PerSecond(10)
-	key := "divergence:persecond10"
+	for _, limit := range []Limit{PerSecond(10), PerSecond(3), PerSecond(7), PerSecond(13), PerMinute(11), PerHour(17)} {
+		key := "exact:" + limit.String()
+		redis := NewLimiter(c, WithRateLimit(limit))
+		mem := NewInMemoryLimiter(WithRateLimit(limit))
+		redis.Reset(ctx, key)
 
-	redis := NewLimiter(c, WithRateLimit(limit))
-	mem := NewInMemoryLimiter(WithRateLimit(limit))
-	defer mem.Close()
-	redis.Reset(ctx, key)
-	defer redis.Reset(ctx, key)
+		rr, err := redis.AllowN(ctx, key, 1)
+		if err != nil {
+			t.Fatalf("%v redis: %v", limit, err)
+		}
+		mr, err := mem.AllowN(ctx, key, 1)
+		if err != nil {
+			t.Fatalf("%v mem: %v", limit, err)
+		}
+		want := limit.Burst - 1
+		if rr.Remaining != want {
+			t.Errorf("%v redis Remaining: got %d, want the exact %d", limit, rr.Remaining, want)
+		}
+		if mr.Remaining != want {
+			t.Errorf("%v mem Remaining: got %d, want the exact %d", limit, mr.Remaining, want)
+		}
+		redis.Reset(ctx, key)
+		mem.Close()
+	}
+}
 
-	rr, err := redis.AllowN(ctx, key, 1)
-	if err != nil {
-		t.Fatalf("redis: %v", err)
-	}
-	mr, err := mem.AllowN(ctx, key, 1)
-	if err != nil {
-		t.Fatalf("mem: %v", err)
+// Drive both backends through the same randomised sequence of calls and require
+// them to agree on every field that is not a wall-clock duration. Limits are
+// kept at an emission interval of 100ms or more so the microseconds that elapse
+// between the paired calls cannot refill a token and cause a false mismatch.
+func TestParity_RandomisedSequences(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(t)
+
+	limits := []Limit{
+		PerSecond(10), PerSecond(3), PerSecond(7), PerSecond(1),
+		PerMinute(13), PerMinute(60), PerHour(11), PerDay(5),
+		{Rate: 4, Burst: 9, Period: time.Second},
+		{Rate: 9, Burst: 4, Period: 2 * time.Second},
 	}
 
-	if mr.Remaining != 9 {
-		t.Errorf("in-memory Remaining: got %d, want the exact 9", mr.Remaining)
-	}
-	if rr.Remaining != 8 {
-		t.Errorf("Redis Remaining: got %d, want 8. If this now reads 9 the float "+
-			"truncation is gone, the backends agree, and this test plus the README "+
-			"note should be deleted. Any other value means the drift changed and the "+
-			"documented divergence is wrong.", rr.Remaining)
-	}
-	if rr.Allowed != mr.Allowed {
-		t.Errorf("admit/deny must not diverge: redis=%d mem=%d", rr.Allowed, mr.Allowed)
+	rnd := rand.New(rand.NewSource(seedFromEnv()))
+	for _, limit := range limits {
+		limit := limit
+		t.Run(limit.String(), func(t *testing.T) {
+			key := "rand:" + limit.String()
+			redis := NewLimiter(c, WithRateLimit(limit))
+			mem := NewInMemoryLimiter(WithRateLimit(limit))
+			defer mem.Close()
+			if err := redis.Reset(ctx, key); err != nil {
+				t.Fatalf("reset: %v", err)
+			}
+			defer redis.Reset(ctx, key)
+
+			for i := 0; i < 40; i++ {
+				n := rnd.Intn(limit.Burst + 2) // sometimes over the burst
+				atMost := rnd.Intn(2) == 0
+
+				var rr, mr *Result
+				var err error
+				if atMost {
+					if rr, err = redis.AllowAtMostN(ctx, key, n); err != nil {
+						t.Fatalf("step %d redis: %v", i, err)
+					}
+					if mr, err = mem.AllowAtMostN(ctx, key, n); err != nil {
+						t.Fatalf("step %d mem: %v", i, err)
+					}
+				} else {
+					if rr, err = redis.AllowN(ctx, key, n); err != nil {
+						t.Fatalf("step %d redis: %v", i, err)
+					}
+					if mr, err = mem.AllowN(ctx, key, n); err != nil {
+						t.Fatalf("step %d mem: %v", i, err)
+					}
+				}
+
+				op := "AllowN"
+				if atMost {
+					op = "AllowAtMostN"
+				}
+				if rr.Allowed != mr.Allowed {
+					t.Fatalf("step %d %s(n=%d): Allowed redis=%d mem=%d", i, op, n, rr.Allowed, mr.Allowed)
+				}
+				if rr.Remaining != mr.Remaining {
+					t.Fatalf("step %d %s(n=%d): Remaining redis=%d mem=%d", i, op, n, rr.Remaining, mr.Remaining)
+				}
+				if (rr.RetryAfter < 0) != (mr.RetryAfter < 0) {
+					t.Fatalf("step %d %s(n=%d): RetryAfter sign redis=%v mem=%v", i, op, n, rr.RetryAfter, mr.RetryAfter)
+				}
+			}
+		})
 	}
 }
 
@@ -658,4 +717,16 @@ func TestWithSweepInterval_ZeroStartsNoGoroutine(t *testing.T) {
 	if got := b.sweep(); got != 1 {
 		t.Errorf("manual sweep reclaimed %d keys, want 1", got)
 	}
+}
+
+// seedFromEnv lets the differential test be replayed with a specific seed
+// (PARITY_SEED=... go test -run RandomisedSequences) while defaulting to a
+// fresh one on every run, so repeated runs explore different sequences.
+func seedFromEnv() int64 {
+	if s := os.Getenv("PARITY_SEED"); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return v
+		}
+	}
+	return time.Now().UnixNano()
 }

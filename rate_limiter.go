@@ -110,7 +110,13 @@ type limitEntry struct {
 	// copies args into its own command buffer, so sharing it is safe.
 	args1 []string
 
-	ei       int64 // emission interval, nanoseconds per token
+	// eiStr and burstOffStr are the script's arguments: the emission interval
+	// and burst offset in whole microseconds. Deriving them here rather than in
+	// Lua keeps the script free of per-call arithmetic.
+	eiStr       string
+	burstOffStr string
+
+	ei       int64 // emission interval, nanoseconds per event
 	burstOff int64 // ei * Burst
 }
 
@@ -128,10 +134,20 @@ func newLimitEntry(l Limit) limitEntry {
 	e.burstOff = ei * int64(l.Burst)
 	e.burstStr = strconv.Itoa(l.Burst)
 	e.rateStr = strconv.Itoa(l.Rate)
-	// Full precision: 'f', 2 rendered any period under 10ms as "0.00", which
-	// made the Lua script divide by zero.
+	// Kept for the String form and for callers reading the entry; the script
+	// itself no longer receives the period. Full precision, because 'f', 2
+	// rendered any period under 10ms as "0.00".
 	e.periodStr = strconv.FormatFloat(l.Period.Seconds(), 'f', -1, 64)
-	e.args1 = []string{e.burstStr, e.rateStr, e.periodStr, "1"}
+
+	// The script works in whole microseconds, which is the resolution Redis
+	// TIME reports. A sub-microsecond interval is charged a microsecond.
+	eiUS := int64(l.Period/time.Microsecond) / int64(l.Rate)
+	if eiUS < 1 {
+		eiUS = 1
+	}
+	e.eiStr = strconv.FormatInt(eiUS, 10)
+	e.burstOffStr = strconv.FormatInt(eiUS*int64(l.Burst), 10)
+	e.args1 = []string{e.eiStr, e.burstOffStr, "1"}
 	return e
 }
 
@@ -143,7 +159,7 @@ func (e limitEntry) argv(n int) []string {
 	if n == 1 {
 		return e.args1
 	}
-	return []string{e.burstStr, e.rateStr, e.periodStr, strconv.Itoa(n)}
+	return []string{e.eiStr, e.burstOffStr, strconv.Itoa(n)}
 }
 
 //------------------------------------------------------------------------------
@@ -319,11 +335,13 @@ func (l *Limiter) Close() error {
 	return l.backend.close()
 }
 
-func dur(f float64) time.Duration {
-	if f == -1 {
+// dur converts a microsecond count from the script into a Duration, passing
+// through the -1 sentinel the script uses for "no retry needed".
+func dur(us float64) time.Duration {
+	if us == -1 {
 		return -1
 	}
-	return time.Duration(f * float64(time.Second))
+	return time.Duration(us) * time.Microsecond
 }
 
 type Result struct {

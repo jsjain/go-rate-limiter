@@ -3,7 +3,10 @@
 Repo: `github.com/jsjain/go-rate-limiter` (Go 1.26, deps: `rueidis`, `xsync/v4`)
 Files today: `rate_limiter.go` (245), `lua.go` (116), `rate_limiter_test.go` (379)
 
-Revision 3. Review findings folded in and marked `[R<n>]`; all open decisions closed.
+Revision 4. Review findings folded in and marked `[R<n>]`; all open decisions closed.
+Implemented. A follow-up beyond the original scope rewrote the Lua scripts in exact integer
+microseconds, which removed the two backend divergences this document had accepted (the
+`allowAtMost` clamp under D2 and the float `Remaining` error). See "Follow-up" at the end.
 
 ## Goals
 
@@ -340,3 +343,37 @@ All forks are closed. Implementation may proceed.
   for speed and needs a reconciliation protocol. Build it when a measured Redis round trip is the
   bottleneck and approximate global limits are acceptable.
 - Per-key sharded locks, LRU with a hard memory cap, metrics hooks, a middleware package.
+
+## Follow-up (implemented after the plan was approved)
+
+The plan accepted two divergences between the backends. Both turned out to have the same root
+cause and both are now fixed, at a measured cost.
+
+The Lua scripts computed GCRA in floating-point seconds, evaluating
+`now - ((tat + increment) - burst_offset)` where `now` is of epoch magnitude. A float64's
+spacing at ~2.9e8 is ~6e-8, so the cancellation lost enough precision that `PerSecond(10)`
+computed 9 available tokens as 8.999999976, which Redis truncated to 8. Rearranging the
+expression to cancel `now` first helped but was not sufficient: a 400k-sample numerical scan
+still showed 66k mismatches, because dividing by a non-representable emission interval is
+fragile regardless of how the numerator is formed.
+
+Both scripts now work in whole microseconds, the resolution Redis `TIME` reports. A microsecond
+count from the 2017 epoch is ~2.9e14, far below the 2^53 limit for exact integers in a double,
+so every value is exact. The emission interval and burst offset are precomputed in Go and passed
+as arguments, so the script derives nothing per call, and the reply is four integers rather than
+two integers and two formatted floats.
+
+Consequences:
+
+- `Remaining` is now exact on both backends; the `PerSecond(10)` off-by-one is gone.
+- `allowAtMost` charges exactly what it reports, so the D2 divergence no longer exists and the
+  parity test covers the clamp case that D2 had excluded.
+- Redis stores the TAT as a ~3e14 integer. Verified that this round-trips exactly: Redis
+  formats command arguments with full precision, unlike Lua's `tostring`, which is `%.14g` and
+  would have lost a digit.
+- Measured by alternating builds on one machine, five rounds each: the Redis path is ~3% slower
+  sequentially and ~12% slower across cores, and saves two allocations per call. Exact integer
+  arithmetic costs more than sloppy float arithmetic; the trade was taken deliberately.
+- Redis quantises the emission interval to whole microseconds while the in-memory backend uses
+  nanoseconds, so `RetryAfter` and `ResetAfter` can differ by under a microsecond. Token counts
+  are unaffected, which a randomised differential test asserts on every run.

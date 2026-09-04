@@ -143,78 +143,85 @@ also the cheaper of the two, since `AllowAtMost` must encode its limit argument 
 
 ## Benchmarks
 
-Apple M4 Pro (14 cores), Go 1.27, Redis 8 on localhost over TCP, `-benchtime 2s -count 3`,
-medians. Local Redis is the *best* case for the network path; a real deployment is slower.
+Apple M4 Pro (14 cores), Go 1.27, Redis 7.2.4 on localhost over TCP,
+`-benchtime 2s -count 5`, medians. Local Redis is the *best* case for the network path; a real
+deployment is slower.
 
 ### In-memory versus Redis
 
 | Workload | Redis | In-memory | Speedup |
 |---|---|---|---|
-| `AllowN`, single key, sequential | 25,337 ns/op | **56.8 ns/op** | 446x |
-| `AllowN`, 100k keys, all cores | 7,053 ns/op | **19.9 ns/op** | 355x |
-| `AllowN`, single hot key, all cores | 7,010 ns/op | **503 ns/op** | 14x |
-| `AllowN`, denied (over limit), all cores | — | **15.2 ns/op** | — |
-| Allocations per call | 6 allocs, 288 B | **1 alloc, 64 B** | — |
+| `AllowN`, single key, sequential | 27,139 ns/op | **58.9 ns/op** | 461x |
+| `AllowN`, 100k keys, all cores | 7,812 ns/op | **20.4 ns/op** | 383x |
+| `AllowN`, single hot key, all cores | 7,651 ns/op | **411 ns/op** | 19x |
+| `AllowN`, denied (over limit), all cores | — | **15.1 ns/op** | — |
+| Allocations per call | 4 allocs, 285 B | **1 alloc, 64 B** | — |
 
-Roughly: ~39k checks/s sequential and ~142k/s across cores on Redis, against ~17.6M/s
-sequential and ~50M/s across cores in memory.
+Roughly: ~37k checks/s sequential and ~128k/s across cores on Redis, against ~17M/s sequential
+and ~49M/s across cores in memory.
 
-**The single-hot-key row is the honest caveat.** Every core contending on one key's CAS costs
-503 ns/op, an order of magnitude worse than the same limiter spread over many keys (19.9 ns/op)
-and worse than the single-threaded number (56.8 ns/op). Rate limiters are usually keyed by
-user or IP, so the 100k-key row is the realistic one, but if you limit everything under one
-global key you will not see the headline speedup. The denied path is the fastest of all, since
-it takes no lock and performs no write.
+**The single-hot-key row is the caveat worth reading.** Every core contending on one key's CAS
+costs 411 ns/op, twenty times worse than the same limiter spread across many keys (20.4 ns/op).
+Rate limiters are normally keyed by user or IP, so the 100k-key row is the realistic one, but if
+you funnel everything through one global key you will not see the headline number. The denied
+path is the fastest of all: it takes no lock and performs no write.
 
 The single allocation is the returned `*Result`.
 
 ### Redis path, before and after this rework
 
+Measured by alternating between the two builds on the same machine, five rounds each, so
+thermal drift cannot favour either side.
+
 | Benchmark | Before | After |
 |---|---|---|
-| `AllowN`, single key, sequential | 27,437 ns/op, 6 allocs | 25,337 ns/op, 6 allocs |
-| `AllowN`, single hot key, all cores | 7,096 ns/op, 6 allocs | 7,010 ns/op, 6 allocs |
-| `AllowN`, 100k keys, all cores | 7,100 ns/op, 6 allocs | 7,053 ns/op, 6 allocs |
+| `AllowN`, single key, sequential | 26,629 ns/op, 6 allocs | 27,499 ns/op, **4 allocs** |
+| `AllowN`, single hot key, all cores | 7,192 ns/op, 6 allocs | 8,081 ns/op, **4 allocs** |
 
-**Unchanged within run-to-run noise, and that is the expected result.** A round trip of ~7 µs
-dominates everything the Go side does, so the encoding work removed from the hot path is
-invisible in `ns/op`. It is not invisible in garbage: reusing the argument slice for the common
-`n == 1` call drops one 64-byte allocation per check, which `ns/op` cannot show.
+**The Redis path got about 3% slower sequentially and 12% slower across cores, and that is a
+deliberate trade.** The Lua scripts were rewritten to work in exact integer microseconds
+instead of floating-point seconds, which is what removes the off-by-one in `Remaining`
+described under Behaviour notes. Exact integer arithmetic costs a little more than sloppy float
+arithmetic. In exchange the reply is now four integers rather than two integers and two
+formatted floats, which removes two allocations per call.
 
-Where the Redis path did measurably improve is `AllowAtMost`, which re-encoded its limit on
-every single call. Measured in the same run:
+If you would rather have the 12% than the exactness, the previous scripts are in the history;
+nothing else in the package depends on which one you use.
+
+`AllowAtMost` also improved, because it no longer re-encodes its limit on every call. Measured
+in the same run:
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---|---|---|
-| `AllowAtMost` (explicit limit, re-encoded per call) | 25,552 | 413 | 9 |
-| `AllowAtMostN` (cached entry) | 25,725 | 321 | **6** |
+| `AllowAtMost` (explicit limit, re-encoded per call) | 27,025 | 416 | 8 |
+| `AllowAtMostN` (cached entry) | 26,936 | 321 | **4** |
 
 Reproduce with:
 
 ```shell
-go test -run '^$' -bench 'Benchmark(Redis|Mem)' -benchtime 2s -count 3
+go test -run '^$' -bench 'Benchmark(Redis|Mem)' -benchtime 2s -count 5
 ```
 
 ## Behaviour notes
 
-- **Clocks.** The Redis backend reads time via the Redis `TIME` command, so it inherits that
+- **Both backends compute GCRA in exact integers**, Redis in microseconds and in-memory in
+  nanoseconds, and they agree on `Allowed` and `Remaining` for every limit. A randomised
+  differential test drives both through the same sequences on every `go test` run.
+- **Redis quantises the emission interval to whole microseconds**, which is the resolution
+  `TIME` reports. An interval finer than a microsecond is charged one microsecond. The
+  in-memory backend works in nanoseconds, so the two can differ by under a microsecond in
+  `RetryAfter` and `ResetAfter`. Token counts are unaffected.
+- **Clocks.** The Redis backend reads time via the Redis `TIME` command and inherits that
   server's wall clock. The in-memory backend uses a monotonic clock and is immune to wall-clock
   jumps and NTP steps.
-- **The Redis backend can under-report `Remaining` by one.** The Lua script computes the
-  remaining token count in floating point, so `PerSecond(10)` makes it evaluate `0.9/0.1` as
-  `8.999999999999998`, which Redis truncates to `8` where the exact answer is `9`. The
-  in-memory backend works in integer nanoseconds and reports `9`. This predates the in-memory
-  backend, matches upstream `redis_rate`, and affects only the reported number, never the
-  admit/deny decision. Limits whose period divides evenly by the rate (`PerMinute(10)`,
-  `PerSecond(100)`) are unaffected.
-- **`AllowAtMost` partial fills differ slightly between backends.** In Lua the remaining-token
-  count is a float, so a clamped request charges a fractional cost to the key's state while
-  Redis truncates the count it reports back. The in-memory backend charges exactly what it
-  reports. The two backends' internal state can therefore drift apart after a clamped
-  `AllowAtMost` call; every other operation agrees exactly.
-- **Periods shorter than 10ms** used to be silently broken on the Redis path: the period was
-  encoded with two decimal places, so anything under 10ms reached the script as `0.00` and made
-  it divide by zero. It is now encoded at full precision.
+- **Previously**, the Redis backend under-reported `Remaining` by one for limits such as
+  `PerSecond(10)`: the script worked in floating-point seconds and subtracted two numbers of
+  epoch magnitude, losing ~6e-8s to cancellation, so 9 available tokens were computed as
+  8.999999976 and truncated to 8. `AllowAtMost` had a related flaw, charging a fractional cost
+  to a key while reporting the truncated integer. Both are fixed. If you are upgrading and have
+  assertions pinned to the old numbers, expect them to change by one.
+- **Periods shorter than 10ms** were silently broken: the period was encoded with two decimal
+  places, so anything under 10ms reached the script as `0.00` and made it divide by zero.
 
 ## License
 
