@@ -3,7 +3,7 @@
 Repo: `github.com/jsjain/go-rate-limiter` (Go 1.26, deps: `rueidis`, `xsync/v4`)
 Files today: `rate_limiter.go` (245), `lua.go` (116), `rate_limiter_test.go` (379)
 
-Revision 2. Revised after review; review findings are folded in and marked `[R<n>]`.
+Revision 3. Review findings folded in and marked `[R<n>]`; all open decisions closed.
 
 ## Goals
 
@@ -157,9 +157,9 @@ must say so.
 
 **[R3] Validation (F8).** `newLimitEntry` validates `Rate > 0`, `Period > 0`, `Burst >= 0`,
 `Burst <= MaxInt64/ei`, and rejects `n < 0` at the call sites. Constructors and `SetCustomLimit`
-must not be able to arm a panic for a later request. Open sub-decision: return an error from
-`SetCustomLimit` (breaking) or fall back to the default limit and document it. Recommendation:
-fall back, document, since `SetCustomLimit` currently returns nothing.
+must not be able to arm a panic for a later request. **Settled (OPEN-2): fall back to the
+limiter's default limit and document it.** `SetCustomLimit` keeps its current no-return
+signature.
 
 ### D3. Eviction — the real in-memory design decision
 
@@ -218,11 +218,11 @@ path takes a lock. That trades G3 away. Recommendation: tombstone.
 
 #### [R13] D3a — ticker versus amortized sweep
 
-**Decision: ticker + `Close()`.** An amortized sweep every N calls needs no goroutine and no
-public `Close()`, but `xsync.Map` has no resumable cursor, so the scan cannot be bounded per call
-and one unlucky caller pays an O(keys) stall inside their request. Predictable tail latency is
-the reason to choose in-memory mode at all. `Close()` is the only public-API growth in this plan
-— flag it if you disagree.
+**Decision (OPEN-1, confirmed): ticker + `Close()`.** An amortized sweep every N calls needs no
+goroutine and no public `Close()`, but `xsync.Map` has no resumable cursor, so the scan cannot be
+bounded per call and one unlucky caller pays an O(keys) stall inside their request. Predictable
+tail latency is the reason to choose in-memory mode at all. `Close()` is the only public-API
+growth in this plan.
 
 Implementation notes: guard `close(stop)` with `sync.Once` so `Close()` is idempotent; after
 `Close()`, `Allow` keeps working and simply stops evicting (simplest defined behaviour, and it
@@ -245,12 +245,11 @@ the loop. `WithPrefix` is a documented no-op for the in-memory backend.
 
 ### D5. Hot-path cost removal
 
-- **[R11] Pointer receivers on `Allow`/`AllowN` (F1) are a BREAKING change**, and revision 1 was
-  wrong to call P1 API-compatible. It breaks any caller holding a `Limiter` *value*: map values,
-  struct fields typed `Limiter`, and any caller-defined interface satisfied by `Limiter` rather
-  than `*Limiter`. Callers going through `NewLimiter` (i.e. `*Limiter`) are unaffected. The
-  stated motive is also not measurable — the struct is ~6 words and the copy inlines. Do it for
-  consistency, labelled as breaking; it is **removed from the hot-path cost list**.
+- **[R11] Pointer receivers on `Allow`/`AllowN` (F1): NOT TAKEN** (OPEN-3b). It would break any
+  caller holding a `Limiter` *value* — map values, struct fields typed `Limiter`, and any
+  caller-defined interface satisfied by `Limiter` rather than `*Limiter` — and the motive is not
+  measurable, since the struct is ~6 words and the copy inlines. Removed from the hot-path cost
+  list and from the work.
 - **[R12] `AllowAtMost` semantics, disambiguated.** For the existing four-arg signature the
   explicit `limit` argument **always wins**; `customLimits` is not consulted, so no existing
   caller changes behaviour. F3 is resolved by documenting this and by adding
@@ -308,31 +307,31 @@ Completion is reported against these numbers, not against a description.
 ## Phases
 
 - P1. Backend seam (D1) + defects F2, F4, F5, F7, F8. **Not a pure refactor**: F7 changes Redis
-  behaviour for sub-10ms periods and updates T1 expectations. F1's receiver change is breaking
-  and is called out in the changelog.
-- P2. In-memory backend (D2, D4) + T2, T3, T6. Blocked on R1, R2, R3, R11, R12, R16 being
-  settled in this document — they now are.
+  behaviour for sub-10ms periods and updates T1's `periodStr` expectations. No source-breaking
+  change — F1 is not taken (OPEN-3b).
+- P2. In-memory backend (D2, D4) + T2, T3, T6. Unblocked: R1, R2, R3, R11, R12, R16 and
+  OPEN-1/2/3 are all settled above.
 - P3. Eviction, tombstone sweeper, and `Close()` (D3) + T4, T5.
 - P4. Benchmarks (B1–B3), README rewrite: F6, the per-process semantics note ([R19] N replicas
   give N times the limit), and the `allowAtMost` divergence.
 
-## Open decisions for the user
+## Decisions (settled 2026-09-04)
 
-These are the only forks left in the document. Implementation of P2 onward should not start
-until they are answered; P1 can proceed regardless except for OPEN-3.
+All forks are closed. Implementation may proceed.
 
-- **OPEN-1 (from D3a).** `Close()` is the plan's only public-API growth. Accept it, or take the
-  amortized-sweep alternative that needs no goroutine and no `Close()` but stalls one caller for
-  O(keys) inside their request? Recommendation: accept `Close()`.
-- **OPEN-2 (from F8 / D2 validation).** An invalid `Limit` (`Rate: 0`) currently arms a panic in
-  the in-memory path. `SetCustomLimit` returns nothing today. Silently fall back to the default
-  limit and document it, or change the signature to return an error (breaking)?
-  Recommendation: fall back and document.
-- **OPEN-3 (from F7 / R11).** Two breaking or behaviour-changing items, independent of each
-  other: (a) F7's `periodStr` precision fix changes Redis results for `Period < 10ms` — the
-  alternative is to reject `Period < 10ms` in validation, preserving current behaviour at the
-  cost of refusing legitimate configs; (b) F1's pointer-receiver change breaks callers holding a
-  `Limiter` value and buys nothing measurable. Recommendation: take (a), skip (b).
+- **OPEN-1 → `Close()` accepted.** Ticker-driven sweeper goroutine, `func (l *Limiter) Close()
+  error`, no-op on the Redis backend. The amortized-sweep alternative is dropped from the plan.
+- **OPEN-2 → fall back and document.** An invalid `Limit` (`Rate <= 0`, `Period <= 0`,
+  `Burst < 0`, or a `Burst` that overflows `burstOffset`) falls back to the limiter's default
+  limit rather than panicking or erroring. `SetCustomLimit` keeps its current signature and
+  returns nothing. The fallback must be documented on `WithCustomLimits`, `WithRateLimit`, and
+  `SetCustomLimit`, and covered by T6.
+- **OPEN-3 → take (a), skip (b).** `periodStr` moves to full precision
+  (`strconv.FormatFloat(seconds, 'f', -1, 64)`), fixing the Redis path for `Period < 10ms` and
+  making cross-backend parity possible; T1's `periodStr` expectations change accordingly.
+  F1's pointer-receiver change is **not taken** — `Allow` and `AllowN` keep their value
+  receivers, so P1 introduces no source-breaking change for existing callers. F1 stays in the
+  defect list as a known inconsistency, not as work.
 
 ## Deferred, with the trigger to build it
 
