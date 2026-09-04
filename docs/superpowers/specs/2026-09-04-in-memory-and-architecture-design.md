@@ -8,7 +8,9 @@ Revision 2. Revised after review; review findings are folded in and marked `[R<n
 ## Goals
 
 - G1. A mode where a rate-limit check never touches the network: pure in-process GCRA.
-- G2. Keep the Redis path exactly as correct as it is now (atomic, cross-process).
+- G2. Keep the Redis path's atomicity and cross-process correctness exactly as they are now.
+  One deliberate exception: F7 changes Redis behaviour for `Period < 10ms`, where the current
+  path is already broken. See F7 and OPEN-3.
 - G3. Cut per-call allocations and copies on both hot paths.
 - G4. Prove G3 with numbers instead of claiming it.
 
@@ -266,8 +268,11 @@ the loop. `WithPrefix` is a documented no-op for the in-memory backend.
 
 ## Testing
 
-- T1. Existing unit tests for `limitEntry` / construction stay green, except where F7 changes
-  the expected `periodStr` values (`rate_limiter_test.go:35-40,79,98-99,114,139,162`).
+- T1. Existing unit tests for `limitEntry` / construction stay green, except for the
+  `periodStr` expectations, which F7 changes (`"1.00"` becomes `"1"`). Only the `wantPeriod`
+  column of the `cases` table and the `periodStr` assertions are affected; `burstStr` and
+  `rateStr` expectations are untouched. Affected assertions: `rate_limiter_test.go:56-58, 79-81,
+  98-100, 113-116, 139-141, 162-164`, plus the `wantPeriod` values at `:35-40`.
 - T2. **[R17] Parity test, expanded.** One sequence checking decisions and `Remaining` is not
   enough to trust a second implementation of the algorithm. Cover: `n > burst` (permanent deny,
   `ResetAfter == 0`); `n == burst` on a fresh key (`diff == 0`, allowed, `Remaining == 0`);
@@ -310,6 +315,24 @@ Completion is reported against these numbers, not against a description.
 - P3. Eviction, tombstone sweeper, and `Close()` (D3) + T4, T5.
 - P4. Benchmarks (B1–B3), README rewrite: F6, the per-process semantics note ([R19] N replicas
   give N times the limit), and the `allowAtMost` divergence.
+
+## Open decisions for the user
+
+These are the only forks left in the document. Implementation of P2 onward should not start
+until they are answered; P1 can proceed regardless except for OPEN-3.
+
+- **OPEN-1 (from D3a).** `Close()` is the plan's only public-API growth. Accept it, or take the
+  amortized-sweep alternative that needs no goroutine and no `Close()` but stalls one caller for
+  O(keys) inside their request? Recommendation: accept `Close()`.
+- **OPEN-2 (from F8 / D2 validation).** An invalid `Limit` (`Rate: 0`) currently arms a panic in
+  the in-memory path. `SetCustomLimit` returns nothing today. Silently fall back to the default
+  limit and document it, or change the signature to return an error (breaking)?
+  Recommendation: fall back and document.
+- **OPEN-3 (from F7 / R11).** Two breaking or behaviour-changing items, independent of each
+  other: (a) F7's `periodStr` precision fix changes Redis results for `Period < 10ms` — the
+  alternative is to reject `Period < 10ms` in validation, preserving current behaviour at the
+  cost of refusing legitimate configs; (b) F1's pointer-receiver change breaks callers holding a
+  `Limiter` value and buys nothing measurable. Recommendation: take (a), skip (b).
 
 ## Deferred, with the trigger to build it
 
