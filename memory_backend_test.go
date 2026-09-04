@@ -14,31 +14,31 @@ import (
 
 // --- helpers ---
 
-func memOf(t testing.TB, l *Limiter) *memBackend {
+func memOf(t testing.TB, limiter *Limiter) *memBackend {
 	t.Helper()
-	b, ok := l.backend.(*memBackend)
+	mem, ok := limiter.backend.(*memBackend)
 	if !ok {
-		t.Fatalf("expected memBackend, got %T", l.backend)
+		t.Fatalf("expected memBackend, got %T", limiter.backend)
 	}
-	return b
+	return mem
 }
 
 // fakeClock replaces the backend's monotonic clock so tests can move time
 // without sleeping.
 type fakeClock struct{ ns atomic.Int64 }
 
-func (c *fakeClock) advance(d time.Duration) { c.ns.Add(int64(d)) }
+func (clock *fakeClock) advance(by time.Duration) { clock.ns.Add(int64(by)) }
 
 // newFakeLimiter returns an in-memory limiter driven by a controllable clock,
 // with the background sweeper disabled so tests drive sweep() themselves.
 func newFakeLimiter(t testing.TB, opts ...LimiterOption) (*Limiter, *fakeClock) {
 	t.Helper()
-	l := NewInMemoryLimiter(append([]LimiterOption{WithSweepInterval(0)}, opts...)...)
-	c := &fakeClock{}
-	c.ns.Store(int64(time.Hour)) // start away from the epoch
-	memOf(t, l).now = c.ns.Load
-	t.Cleanup(func() { l.Close() })
-	return l, c
+	limiter := NewInMemoryLimiter(append([]LimiterOption{WithSweepInterval(0)}, opts...)...)
+	clock := &fakeClock{}
+	clock.ns.Store(int64(time.Hour)) // start away from the epoch
+	memOf(t, limiter).now = clock.ns.Load
+	t.Cleanup(func() { limiter.Close() })
+	return limiter, clock
 }
 
 // --- T2: parity between the in-memory and Redis backends ---
@@ -52,7 +52,7 @@ type step struct {
 
 func TestParity_InMemoryMatchesRedis(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(t)
+	client := newTestClient(t)
 
 	// PerMinute scale: emission interval is 1s, so microsecond drift between
 	// the two backends cannot flip a Remaining boundary.
@@ -80,9 +80,9 @@ func TestParity_InMemoryMatchesRedis(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			redis := NewLimiter(c, WithRateLimit(tc.limit))
-			mem := NewInMemoryLimiter(WithRateLimit(tc.limit))
-			defer mem.Close()
+			redis := NewLimiter(client, WithRateLimit(tc.limit))
+			memLimiter := NewInMemoryLimiter(WithRateLimit(tc.limit))
+			defer memLimiter.Close()
 
 			key := "parity:" + t.Name()
 			if err := redis.Reset(ctx, key); err != nil {
@@ -91,25 +91,25 @@ func TestParity_InMemoryMatchesRedis(t *testing.T) {
 			defer redis.Reset(ctx, key)
 
 			for i, s := range tc.steps {
-				rr, err := redis.AllowN(ctx, key, s.n)
+				redisRes, err := redis.AllowN(ctx, key, s.n)
 				if err != nil {
 					t.Fatalf("step %d redis: %v", i, err)
 				}
-				mr, err := mem.AllowN(ctx, key, s.n)
+				memRes, err := memLimiter.AllowN(ctx, key, s.n)
 				if err != nil {
 					t.Fatalf("step %d mem: %v", i, err)
 				}
-				if rr.Allowed != s.wantAllowed || rr.Remaining != s.wantRemain {
+				if redisRes.Allowed != s.wantAllowed || redisRes.Remaining != s.wantRemain {
 					t.Errorf("step %d redis: allowed=%d remaining=%d, want %d/%d",
-						i, rr.Allowed, rr.Remaining, s.wantAllowed, s.wantRemain)
+						i, redisRes.Allowed, redisRes.Remaining, s.wantAllowed, s.wantRemain)
 				}
-				if mr.Allowed != rr.Allowed || mr.Remaining != rr.Remaining {
+				if memRes.Allowed != redisRes.Allowed || memRes.Remaining != redisRes.Remaining {
 					t.Errorf("step %d divergence: mem allowed=%d remaining=%d, redis allowed=%d remaining=%d",
-						i, mr.Allowed, mr.Remaining, rr.Allowed, rr.Remaining)
+						i, memRes.Allowed, memRes.Remaining, redisRes.Allowed, redisRes.Remaining)
 				}
 				// RetryAfter must agree on sign: -1 when allowed, positive when not.
-				if (mr.RetryAfter < 0) != (rr.RetryAfter < 0) {
-					t.Errorf("step %d RetryAfter sign: mem=%v redis=%v", i, mr.RetryAfter, rr.RetryAfter)
+				if (memRes.RetryAfter < 0) != (redisRes.RetryAfter < 0) {
+					t.Errorf("step %d RetryAfter sign: mem=%v redis=%v", i, memRes.RetryAfter, redisRes.RetryAfter)
 				}
 			}
 		})
@@ -120,18 +120,18 @@ func TestParity_InMemoryMatchesRedis(t *testing.T) {
 // on an otherwise idle key.
 func TestParity_OverBurstIsPermanent(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(t)
+	client := newTestClient(t)
 	limit := PerMinute(3)
 	key := "parity:overburst"
 
-	redis := NewLimiter(c, WithRateLimit(limit))
-	mem := NewInMemoryLimiter(WithRateLimit(limit))
-	defer mem.Close()
+	redis := NewLimiter(client, WithRateLimit(limit))
+	memLimiter := NewInMemoryLimiter(WithRateLimit(limit))
+	defer memLimiter.Close()
 	redis.Reset(ctx, key)
 	defer redis.Reset(ctx, key)
 
-	for name, l := range map[string]*Limiter{"redis": redis, "mem": mem} {
-		res, err := l.AllowN(ctx, key, 4)
+	for name, limiter := range map[string]*Limiter{"redis": redis, "mem": memLimiter} {
+		res, err := limiter.AllowN(ctx, key, 4)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -150,25 +150,25 @@ func TestParity_OverBurstIsPermanent(t *testing.T) {
 // Reset must restore a fully exhausted key on both backends.
 func TestParity_ResetRestores(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(t)
+	client := newTestClient(t)
 	limit := PerMinute(1)
 	key := "parity:reset"
 
-	redis := NewLimiter(c, WithRateLimit(limit))
-	mem := NewInMemoryLimiter(WithRateLimit(limit))
-	defer mem.Close()
+	redis := NewLimiter(client, WithRateLimit(limit))
+	memLimiter := NewInMemoryLimiter(WithRateLimit(limit))
+	defer memLimiter.Close()
 	redis.Reset(ctx, key)
 	defer redis.Reset(ctx, key)
 
-	for name, l := range map[string]*Limiter{"redis": redis, "mem": mem} {
-		l.Allow(ctx, key)
-		if res, _ := l.Allow(ctx, key); res.Allowed != 0 {
+	for name, limiter := range map[string]*Limiter{"redis": redis, "mem": memLimiter} {
+		limiter.Allow(ctx, key)
+		if res, _ := limiter.Allow(ctx, key); res.Allowed != 0 {
 			t.Fatalf("%s: expected exhausted", name)
 		}
-		if err := l.Reset(ctx, key); err != nil {
+		if err := limiter.Reset(ctx, key); err != nil {
 			t.Fatalf("%s reset: %v", name, err)
 		}
-		if res, _ := l.Allow(ctx, key); res.Allowed != 1 {
+		if res, _ := limiter.Allow(ctx, key); res.Allowed != 1 {
 			t.Errorf("%s: expected allowed after reset, got %d", name, res.Allowed)
 		}
 	}
@@ -178,15 +178,15 @@ func TestParity_ResetRestores(t *testing.T) {
 
 func TestInMemory_RetryAfterIsExact(t *testing.T) {
 	ctx := context.Background()
-	l, clock := newFakeLimiter(t, WithRateLimit(PerSecond(4))) // emission interval 250ms
+	limiter, clock := newFakeLimiter(t, WithRateLimit(PerSecond(4))) // emission interval 250ms
 	key := "retryafter"
 
 	for i := 0; i < 4; i++ {
-		if res, _ := l.AllowN(ctx, key, 1); res.Allowed != 1 {
+		if res, _ := limiter.AllowN(ctx, key, 1); res.Allowed != 1 {
 			t.Fatalf("request %d should be allowed", i)
 		}
 	}
-	res, _ := l.AllowN(ctx, key, 1)
+	res, _ := limiter.AllowN(ctx, key, 1)
 	if res.Allowed != 0 {
 		t.Fatal("5th request should be denied")
 	}
@@ -196,21 +196,21 @@ func TestInMemory_RetryAfterIsExact(t *testing.T) {
 
 	// One nanosecond short of RetryAfter: still denied.
 	clock.advance(res.RetryAfter - 1)
-	if r, _ := l.AllowN(ctx, key, 1); r.Allowed != 0 {
+	if r, _ := limiter.AllowN(ctx, key, 1); r.Allowed != 0 {
 		t.Errorf("expected denial 1ns before RetryAfter elapses, got allowed=%d", r.Allowed)
 	}
 	// Exactly at RetryAfter: allowed.
 	clock.advance(1)
-	if r, _ := l.AllowN(ctx, key, 1); r.Allowed != 1 {
+	if r, _ := limiter.AllowN(ctx, key, 1); r.Allowed != 1 {
 		t.Errorf("expected admission exactly at RetryAfter, got allowed=%d", r.Allowed)
 	}
 }
 
 func TestInMemory_ResetAfterIsExact(t *testing.T) {
 	ctx := context.Background()
-	l, _ := newFakeLimiter(t, WithRateLimit(PerSecond(4)))
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerSecond(4)))
 
-	res, _ := l.AllowN(ctx, "resetafter", 2)
+	res, _ := limiter.AllowN(ctx, "resetafter", 2)
 	if res.Allowed != 2 {
 		t.Fatalf("expected 2 allowed, got %d", res.Allowed)
 	}
@@ -223,40 +223,40 @@ func TestInMemory_ResetAfterIsExact(t *testing.T) {
 func TestInMemory_CustomLimitResolved(t *testing.T) {
 	ctx := context.Background()
 	key := "custom:key"
-	l, _ := newFakeLimiter(t,
+	limiter, _ := newFakeLimiter(t,
 		WithRateLimit(PerSecond(100)),
 		WithCustomLimits(map[string]Limit{key: PerSecond(1)}),
 	)
 
-	if res, _ := l.Allow(ctx, key); res.Allowed != 1 {
+	if res, _ := limiter.Allow(ctx, key); res.Allowed != 1 {
 		t.Fatal("first call should be allowed")
 	}
-	if res, _ := l.Allow(ctx, key); res.Allowed != 0 {
+	if res, _ := limiter.Allow(ctx, key); res.Allowed != 0 {
 		t.Error("custom limit of 1/s should deny the second call")
 	}
 	// A key without an override uses the default.
-	if res, _ := l.Allow(ctx, "other"); res.Allowed != 1 {
+	if res, _ := limiter.Allow(ctx, "other"); res.Allowed != 1 {
 		t.Error("default limit should admit an unrelated key")
 	}
 }
 
 func TestInMemory_AllowAtMostClamps(t *testing.T) {
 	ctx := context.Background()
-	l, _ := newFakeLimiter(t, WithRateLimit(PerSecond(10)))
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerSecond(10)))
 	key := "atmost"
 
-	if res, _ := l.AllowAtMostN(ctx, key, 7); res.Allowed != 7 {
+	if res, _ := limiter.AllowAtMostN(ctx, key, 7); res.Allowed != 7 {
 		t.Fatalf("expected 7 allowed, got %d", res.Allowed)
 	}
 	// Only 3 remain, so a request for 5 is clamped down to 3.
-	res, _ := l.AllowAtMostN(ctx, key, 5)
+	res, _ := limiter.AllowAtMostN(ctx, key, 5)
 	if res.Allowed != 3 {
 		t.Errorf("expected clamp to 3, got %d", res.Allowed)
 	}
 	if res.Remaining != 0 {
 		t.Errorf("expected Remaining=0 after clamp, got %d", res.Remaining)
 	}
-	if res, _ := l.AllowAtMostN(ctx, key, 1); res.Allowed != 0 {
+	if res, _ := limiter.AllowAtMostN(ctx, key, 1); res.Allowed != 0 {
 		t.Errorf("expected denial once exhausted, got %d", res.Allowed)
 	}
 }
@@ -267,7 +267,7 @@ func TestInMemory_AllowAtMostClamps(t *testing.T) {
 func TestInMemory_ConcurrentExactBurst(t *testing.T) {
 	ctx := context.Background()
 	const burst = 50
-	l, _ := newFakeLimiter(t, WithRateLimit(PerMinute(burst)))
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerMinute(burst)))
 	key := "concurrent"
 
 	var allowed atomic.Int64
@@ -277,7 +277,7 @@ func TestInMemory_ConcurrentExactBurst(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				res, err := l.Allow(ctx, key)
+				res, err := limiter.Allow(ctx, key)
 				if err != nil {
 					t.Error(err)
 					return
@@ -296,16 +296,16 @@ func TestInMemory_ConcurrentExactBurst(t *testing.T) {
 // The deny path must not write: a denied call cannot push the TAT further out.
 func TestInMemory_DenyDoesNotWrite(t *testing.T) {
 	ctx := context.Background()
-	l, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
-	b := memOf(t, l)
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
+	mem := memOf(t, limiter)
 	key := "denywrite"
 
-	l.AllowN(ctx, key, 2) // exhaust
-	cell, _ := b.state.Load(key)
+	limiter.AllowN(ctx, key, 2) // exhaust
+	cell, _ := mem.state.Load(key)
 	before := cell.Load()
 
 	for i := 0; i < 10; i++ {
-		if res, _ := l.Allow(ctx, key); res.Allowed != 0 {
+		if res, _ := limiter.Allow(ctx, key); res.Allowed != 0 {
 			t.Fatal("expected denial")
 		}
 	}
@@ -331,8 +331,8 @@ func TestInMemory_SweeperDoesNotLoseUpdates(t *testing.T) {
 		sweepRounds = 400
 	)
 	// Burst of 1 maximises sensitivity: a single lost update shows up as 2.
-	l, _ := newFakeLimiter(t, WithRateLimit(PerMinute(burst)))
-	b := memOf(t, l)
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerMinute(burst)))
+	mem := memOf(t, limiter)
 
 	done := make(chan struct{})
 	var sweeps sync.WaitGroup
@@ -344,7 +344,7 @@ func TestInMemory_SweeperDoesNotLoseUpdates(t *testing.T) {
 			case <-done:
 				return
 			default:
-				b.sweep()
+				mem.sweep()
 			}
 		}
 	}()
@@ -357,7 +357,7 @@ func TestInMemory_SweeperDoesNotLoseUpdates(t *testing.T) {
 			wg.Add(1)
 			go func(idx int, k string) {
 				defer wg.Done()
-				res, err := l.Allow(ctx, k)
+				res, err := limiter.Allow(ctx, k)
 				if err != nil {
 					t.Error(err)
 					return
@@ -400,57 +400,57 @@ func itoa(i int) string {
 
 func TestInMemory_SweepReclaimsExpiredKeys(t *testing.T) {
 	ctx := context.Background()
-	l, clock := newFakeLimiter(t, WithRateLimit(PerSecond(1)))
-	b := memOf(t, l)
+	limiter, clock := newFakeLimiter(t, WithRateLimit(PerSecond(1)))
+	mem := memOf(t, limiter)
 
 	for _, k := range []string{"a", "b", "c"} {
-		if res, _ := l.Allow(ctx, k); res.Allowed != 1 {
+		if res, _ := limiter.Allow(ctx, k); res.Allowed != 1 {
 			t.Fatalf("key %q should be allowed", k)
 		}
 	}
-	if n := b.state.Size(); n != 3 {
+	if n := mem.state.Size(); n != 3 {
 		t.Fatalf("expected 3 live keys, got %d", n)
 	}
 
 	// Not yet expired: the sweeper must leave them alone.
-	if got := b.sweep(); got != 0 {
+	if got := mem.sweep(); got != 0 {
 		t.Errorf("swept %d keys before they expired, want 0", got)
 	}
-	if n := b.state.Size(); n != 3 {
+	if n := mem.state.Size(); n != 3 {
 		t.Errorf("expected 3 live keys after an early sweep, got %d", n)
 	}
 
 	clock.advance(2 * time.Second) // past every TAT
-	if got := b.sweep(); got != 3 {
+	if got := mem.sweep(); got != 3 {
 		t.Errorf("swept %d keys, want 3", got)
 	}
-	if n := b.state.Size(); n != 0 {
+	if n := mem.state.Size(); n != 0 {
 		t.Errorf("expected an empty map after sweeping, got %d", n)
 	}
 
 	// A reclaimed key still behaves correctly: it is simply idle again.
-	if res, _ := l.Allow(ctx, "a"); res.Allowed != 1 {
+	if res, _ := limiter.Allow(ctx, "a"); res.Allowed != 1 {
 		t.Errorf("expected a reclaimed key to be admitted, got %d", res.Allowed)
 	}
 }
 
 func TestInMemory_ResetDropsKey(t *testing.T) {
 	ctx := context.Background()
-	l, _ := newFakeLimiter(t, WithRateLimit(PerSecond(1)))
-	b := memOf(t, l)
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerSecond(1)))
+	mem := memOf(t, limiter)
 
-	l.Allow(ctx, "gone")
-	if _, ok := b.state.Load("gone"); !ok {
+	limiter.Allow(ctx, "gone")
+	if _, ok := mem.state.Load("gone"); !ok {
 		t.Fatal("expected the key to exist")
 	}
-	if err := l.Reset(ctx, "gone"); err != nil {
+	if err := limiter.Reset(ctx, "gone"); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	if _, ok := b.state.Load("gone"); ok {
+	if _, ok := mem.state.Load("gone"); ok {
 		t.Error("expected the key to be removed after Reset")
 	}
 	// Reset on an unknown key is not an error.
-	if err := l.Reset(ctx, "never-seen"); err != nil {
+	if err := limiter.Reset(ctx, "never-seen"); err != nil {
 		t.Errorf("reset of an unknown key: %v", err)
 	}
 }
@@ -459,32 +459,32 @@ func TestInMemory_ResetDropsKey(t *testing.T) {
 
 func TestInMemory_CloseIsIdempotentAndKeepsWorking(t *testing.T) {
 	ctx := context.Background()
-	l := NewInMemoryLimiter(WithRateLimit(PerSecond(2)), WithSweepInterval(time.Millisecond))
+	limiter := NewInMemoryLimiter(WithRateLimit(PerSecond(2)), WithSweepInterval(time.Millisecond))
 
-	if err := l.Close(); err != nil {
+	if err := limiter.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)
 	}
-	if err := l.Close(); err != nil {
+	if err := limiter.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
 	// Closing stops eviction, not enforcement.
-	if res, err := l.Allow(ctx, "after-close"); err != nil || res.Allowed != 1 {
+	if res, err := limiter.Allow(ctx, "after-close"); err != nil || res.Allowed != 1 {
 		t.Errorf("expected the limiter to keep working after Close, got allowed=%d err=%v", res.Allowed, err)
 	}
 }
 
 func TestRedis_CloseDoesNotCloseClient(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(t)
-	l := NewLimiter(c, WithRateLimit(PerSecond(5)))
+	client := newTestClient(t)
+	limiter := NewLimiter(client, WithRateLimit(PerSecond(5)))
 	key := "close:client"
-	defer l.Reset(ctx, key)
+	defer limiter.Reset(ctx, key)
 
-	if err := l.Close(); err != nil {
+	if err := limiter.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	// The caller owns the client, so it must still be usable.
-	if res, err := l.Allow(ctx, key); err != nil || res.Allowed != 1 {
+	if res, err := limiter.Allow(ctx, key); err != nil || res.Allowed != 1 {
 		t.Errorf("client unusable after Close: allowed=%d err=%v", res.Allowed, err)
 	}
 }
@@ -502,46 +502,46 @@ func TestInvalidLimitsFallBackToDefault(t *testing.T) {
 	}
 
 	for _, limit := range bad {
-		if e := newLimitEntry(limit); e.valid() {
+		if entry := newLimitEntry(limit); entry.valid() {
 			t.Errorf("limit %+v should be rejected as invalid", limit)
 		}
 	}
 
 	// An invalid default keeps the package default rather than panicking.
-	l := NewInMemoryLimiter(WithRateLimit(Limit{}))
-	defer l.Close()
-	if l.limit.limit != defaultLimits() {
-		t.Errorf("invalid WithRateLimit should keep the default, got %v", l.limit.limit)
+	limiter := NewInMemoryLimiter(WithRateLimit(Limit{}))
+	defer limiter.Close()
+	if limiter.limit.limit != defaultLimits() {
+		t.Errorf("invalid WithRateLimit should keep the default, got %v", limiter.limit.limit)
 	}
 
 	// An invalid override is not stored, so the key uses the default limit.
-	l2 := NewInMemoryLimiter(WithRateLimit(PerSecond(2)))
-	defer l2.Close()
-	l2.SetCustomLimit("k", Limit{Rate: 0})
-	if _, ok := l2.customLimits.Load("k"); ok {
+	fallbackLimiter := NewInMemoryLimiter(WithRateLimit(PerSecond(2)))
+	defer fallbackLimiter.Close()
+	fallbackLimiter.SetCustomLimit("k", Limit{Rate: 0})
+	if _, ok := fallbackLimiter.customLimits.Load("k"); ok {
 		t.Error("invalid SetCustomLimit should not be stored")
 	}
 	for i := 0; i < 2; i++ {
-		if res, err := l2.Allow(ctx, "k"); err != nil || res.Allowed != 1 {
+		if res, err := fallbackLimiter.Allow(ctx, "k"); err != nil || res.Allowed != 1 {
 			t.Fatalf("call %d: expected the default limit to apply, got allowed=%d err=%v", i, res.Allowed, err)
 		}
 	}
-	if res, _ := l2.Allow(ctx, "k"); res.Allowed != 0 {
+	if res, _ := fallbackLimiter.Allow(ctx, "k"); res.Allowed != 0 {
 		t.Error("expected the default limit of 2/s to deny the third call")
 	}
 }
 
 func TestNegativeCountRejected(t *testing.T) {
 	ctx := context.Background()
-	l, _ := newFakeLimiter(t, WithRateLimit(PerSecond(5)))
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerSecond(5)))
 
-	if _, err := l.AllowN(ctx, "neg", -1); err != ErrNegativeCount {
+	if _, err := limiter.AllowN(ctx, "neg", -1); err != ErrNegativeCount {
 		t.Errorf("AllowN(-1): got %v, want ErrNegativeCount", err)
 	}
-	if _, err := l.AllowAtMostN(ctx, "neg", -1); err != ErrNegativeCount {
+	if _, err := limiter.AllowAtMostN(ctx, "neg", -1); err != ErrNegativeCount {
 		t.Errorf("AllowAtMostN(-1): got %v, want ErrNegativeCount", err)
 	}
-	if _, err := l.AllowAtMost(ctx, "neg", Limit{}, 1); err != ErrInvalidLimit {
+	if _, err := limiter.AllowAtMost(ctx, "neg", Limit{}, 1); err != ErrInvalidLimit {
 		t.Errorf("AllowAtMost with an invalid limit: got %v, want ErrInvalidLimit", err)
 	}
 }
@@ -551,31 +551,31 @@ func TestNegativeCountRejected(t *testing.T) {
 // where the exact answer is 9. Both backends now work in exact integers.
 func TestParity_PerSecondRemainingIsExact(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(t)
+	client := newTestClient(t)
 
 	for _, limit := range []Limit{PerSecond(10), PerSecond(3), PerSecond(7), PerSecond(13), PerMinute(11), PerHour(17)} {
 		key := "exact:" + limit.String()
-		redis := NewLimiter(c, WithRateLimit(limit))
-		mem := NewInMemoryLimiter(WithRateLimit(limit))
+		redis := NewLimiter(client, WithRateLimit(limit))
+		memLimiter := NewInMemoryLimiter(WithRateLimit(limit))
 		redis.Reset(ctx, key)
 
-		rr, err := redis.AllowN(ctx, key, 1)
+		redisRes, err := redis.AllowN(ctx, key, 1)
 		if err != nil {
 			t.Fatalf("%v redis: %v", limit, err)
 		}
-		mr, err := mem.AllowN(ctx, key, 1)
+		memRes, err := memLimiter.AllowN(ctx, key, 1)
 		if err != nil {
 			t.Fatalf("%v mem: %v", limit, err)
 		}
 		want := limit.Burst - 1
-		if rr.Remaining != want {
-			t.Errorf("%v redis Remaining: got %d, want the exact %d", limit, rr.Remaining, want)
+		if redisRes.Remaining != want {
+			t.Errorf("%v redis Remaining: got %d, want the exact %d", limit, redisRes.Remaining, want)
 		}
-		if mr.Remaining != want {
-			t.Errorf("%v mem Remaining: got %d, want the exact %d", limit, mr.Remaining, want)
+		if memRes.Remaining != want {
+			t.Errorf("%v mem Remaining: got %d, want the exact %d", limit, memRes.Remaining, want)
 		}
 		redis.Reset(ctx, key)
-		mem.Close()
+		memLimiter.Close()
 	}
 }
 
@@ -585,7 +585,7 @@ func TestParity_PerSecondRemainingIsExact(t *testing.T) {
 // between the paired calls cannot refill a token and cause a false mismatch.
 func TestParity_RandomisedSequences(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(t)
+	client := newTestClient(t)
 
 	limits := []Limit{
 		PerSecond(10), PerSecond(3), PerSecond(7), PerSecond(1),
@@ -599,9 +599,9 @@ func TestParity_RandomisedSequences(t *testing.T) {
 		limit := limit
 		t.Run(limit.String(), func(t *testing.T) {
 			key := "rand:" + limit.String()
-			redis := NewLimiter(c, WithRateLimit(limit))
-			mem := NewInMemoryLimiter(WithRateLimit(limit))
-			defer mem.Close()
+			redis := NewLimiter(client, WithRateLimit(limit))
+			memLimiter := NewInMemoryLimiter(WithRateLimit(limit))
+			defer memLimiter.Close()
 			if err := redis.Reset(ctx, key); err != nil {
 				t.Fatalf("reset: %v", err)
 			}
@@ -611,20 +611,20 @@ func TestParity_RandomisedSequences(t *testing.T) {
 				n := rnd.Intn(limit.Burst + 2) // sometimes over the burst
 				atMost := rnd.Intn(2) == 0
 
-				var rr, mr *Result
+				var redisRes, memRes *Result
 				var err error
 				if atMost {
-					if rr, err = redis.AllowAtMostN(ctx, key, n); err != nil {
+					if redisRes, err = redis.AllowAtMostN(ctx, key, n); err != nil {
 						t.Fatalf("step %d redis: %v", i, err)
 					}
-					if mr, err = mem.AllowAtMostN(ctx, key, n); err != nil {
+					if memRes, err = memLimiter.AllowAtMostN(ctx, key, n); err != nil {
 						t.Fatalf("step %d mem: %v", i, err)
 					}
 				} else {
-					if rr, err = redis.AllowN(ctx, key, n); err != nil {
+					if redisRes, err = redis.AllowN(ctx, key, n); err != nil {
 						t.Fatalf("step %d redis: %v", i, err)
 					}
-					if mr, err = mem.AllowN(ctx, key, n); err != nil {
+					if memRes, err = memLimiter.AllowN(ctx, key, n); err != nil {
 						t.Fatalf("step %d mem: %v", i, err)
 					}
 				}
@@ -633,14 +633,14 @@ func TestParity_RandomisedSequences(t *testing.T) {
 				if atMost {
 					op = "AllowAtMostN"
 				}
-				if rr.Allowed != mr.Allowed {
-					t.Fatalf("step %d %s(n=%d): Allowed redis=%d mem=%d", i, op, n, rr.Allowed, mr.Allowed)
+				if redisRes.Allowed != memRes.Allowed {
+					t.Fatalf("step %d %s(n=%d): Allowed redis=%d mem=%d", i, op, n, redisRes.Allowed, memRes.Allowed)
 				}
-				if rr.Remaining != mr.Remaining {
-					t.Fatalf("step %d %s(n=%d): Remaining redis=%d mem=%d", i, op, n, rr.Remaining, mr.Remaining)
+				if redisRes.Remaining != memRes.Remaining {
+					t.Fatalf("step %d %s(n=%d): Remaining redis=%d mem=%d", i, op, n, redisRes.Remaining, memRes.Remaining)
 				}
-				if (rr.RetryAfter < 0) != (mr.RetryAfter < 0) {
-					t.Fatalf("step %d %s(n=%d): RetryAfter sign redis=%v mem=%v", i, op, n, rr.RetryAfter, mr.RetryAfter)
+				if (redisRes.RetryAfter < 0) != (memRes.RetryAfter < 0) {
+					t.Fatalf("step %d %s(n=%d): RetryAfter sign redis=%v mem=%v", i, op, n, redisRes.RetryAfter, memRes.RetryAfter)
 				}
 			}
 		})
@@ -653,11 +653,11 @@ func TestParity_RandomisedSequences(t *testing.T) {
 func TestAllowAtMost_ExplicitLimitBeatsCustomLimit(t *testing.T) {
 	ctx := context.Background()
 	key := "atmost:explicit"
-	l, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
-	l.SetCustomLimit(key, PerSecond(3))
+	limiter, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
+	limiter.SetCustomLimit(key, PerSecond(3))
 
 	explicit := PerSecond(9)
-	res, err := l.AllowAtMost(ctx, key, explicit, 9)
+	res, err := limiter.AllowAtMost(ctx, key, explicit, 9)
 	if err != nil {
 		t.Fatalf("AllowAtMost: %v", err)
 	}
@@ -669,9 +669,9 @@ func TestAllowAtMost_ExplicitLimitBeatsCustomLimit(t *testing.T) {
 	}
 
 	// AllowAtMostN on the same key resolves the custom limit of 3/s instead.
-	l2, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
-	l2.SetCustomLimit(key, PerSecond(3))
-	res, err = l2.AllowAtMostN(ctx, key, 9)
+	fallbackLimiter, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
+	fallbackLimiter.SetCustomLimit(key, PerSecond(3))
+	res, err = fallbackLimiter.AllowAtMostN(ctx, key, 9)
 	if err != nil {
 		t.Fatalf("AllowAtMostN: %v", err)
 	}
@@ -698,23 +698,23 @@ func TestWithSweepInterval_ZeroStartsNoGoroutine(t *testing.T) {
 	if got := runtime.NumGoroutine(); got > before {
 		t.Errorf("WithSweepInterval(0) started %d goroutine(s); want none", got-before)
 	}
-	for _, l := range limiters {
-		if err := l.Close(); err != nil {
+	for _, created := range limiters {
+		if err := created.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
 		}
 	}
 
 	// Sweeping still works when driven by hand.
-	l := NewInMemoryLimiter(WithSweepInterval(0), WithRateLimit(PerSecond(1)))
-	defer l.Close()
-	b := memOf(t, l)
+	limiter := NewInMemoryLimiter(WithSweepInterval(0), WithRateLimit(PerSecond(1)))
+	defer limiter.Close()
+	mem := memOf(t, limiter)
 	clock := &fakeClock{}
 	clock.ns.Store(int64(time.Hour))
-	b.now = clock.ns.Load
+	mem.now = clock.ns.Load
 
-	l.Allow(context.Background(), "manual")
+	limiter.Allow(context.Background(), "manual")
 	clock.advance(2 * time.Second)
-	if got := b.sweep(); got != 1 {
+	if got := mem.sweep(); got != 1 {
 		t.Errorf("manual sweep reclaimed %d keys, want 1", got)
 	}
 }
