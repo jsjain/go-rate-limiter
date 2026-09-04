@@ -32,12 +32,12 @@ func TestNewLimitEntry_Strings(t *testing.T) {
 		wantRate   string
 		wantPeriod string
 	}{
-		{"PerSecond", PerSecond(10), "10", "10", "1.00"},
-		{"PerMinute", PerMinute(60), "60", "60", "60.00"},
-		{"PerHour", PerHour(100), "100", "100", "3600.00"},
-		{"PerDay", PerDay(200), "200", "200", "86400.00"},
-		{"CustomBurst", Limit{Rate: 5, Burst: 20, Period: time.Second}, "20", "5", "1.00"},
-		{"CustomPeriod", Limit{Rate: 3, Burst: 3, Period: 5 * time.Second}, "3", "3", "5.00"},
+		{"PerSecond", PerSecond(10), "10", "10", "1"},
+		{"PerMinute", PerMinute(60), "60", "60", "60"},
+		{"PerHour", PerHour(100), "100", "100", "3600"},
+		{"PerDay", PerDay(200), "200", "200", "86400"},
+		{"CustomBurst", Limit{Rate: 5, Burst: 20, Period: time.Second}, "20", "5", "1"},
+		{"CustomPeriod", Limit{Rate: 3, Burst: 3, Period: 5 * time.Second}, "3", "3", "5"},
 	}
 
 	for _, tc := range cases {
@@ -76,7 +76,7 @@ func TestNewLimitEntry_MatchesStrconv(t *testing.T) {
 		if got, want := e.rateStr, strconv.Itoa(l.Rate); got != want {
 			t.Errorf("rateStr for %v: got %q, want %q", l, got, want)
 		}
-		if got, want := e.periodStr, strconv.FormatFloat(l.Period.Seconds(), 'f', 2, 32); got != want {
+		if got, want := e.periodStr, strconv.FormatFloat(l.Period.Seconds(), 'f', -1, 64); got != want {
 			t.Errorf("periodStr for %v: got %q, want %q", l, got, want)
 		}
 	}
@@ -95,8 +95,8 @@ func TestNewLimiter_DefaultLimitCompiled(t *testing.T) {
 	if l.limit.burstStr != strconv.Itoa(def.Burst) {
 		t.Errorf("default burstStr: got %q, want %q", l.limit.burstStr, strconv.Itoa(def.Burst))
 	}
-	if l.limit.periodStr != strconv.FormatFloat(def.Period.Seconds(), 'f', 2, 32) {
-		t.Errorf("default periodStr: got %q, want %q", l.limit.periodStr, strconv.FormatFloat(def.Period.Seconds(), 'f', 2, 32))
+	if l.limit.periodStr != strconv.FormatFloat(def.Period.Seconds(), 'f', -1, 64) {
+		t.Errorf("default periodStr: got %q, want %q", l.limit.periodStr, strconv.FormatFloat(def.Period.Seconds(), 'f', -1, 64))
 	}
 }
 
@@ -111,8 +111,8 @@ func TestWithRateLimit_Compiled(t *testing.T) {
 	if l.limit.burstStr != "100" {
 		t.Errorf("burstStr: got %q, want %q", l.limit.burstStr, "100")
 	}
-	if l.limit.periodStr != "60.00" {
-		t.Errorf("periodStr: got %q, want %q", l.limit.periodStr, "60.00")
+	if l.limit.periodStr != "60" {
+		t.Errorf("periodStr: got %q, want %q", l.limit.periodStr, "60")
 	}
 }
 
@@ -136,7 +136,7 @@ func TestWithCustomLimits_Compiled(t *testing.T) {
 		if entry.burstStr != strconv.Itoa(want.Burst) {
 			t.Errorf("key %q: burstStr got %q, want %q", key, entry.burstStr, strconv.Itoa(want.Burst))
 		}
-		if entry.periodStr != strconv.FormatFloat(want.Period.Seconds(), 'f', 2, 32) {
+		if entry.periodStr != strconv.FormatFloat(want.Period.Seconds(), 'f', -1, 64) {
 			t.Errorf("key %q: periodStr got %q", key, entry.periodStr)
 		}
 	}
@@ -159,8 +159,8 @@ func TestSetCustomLimit_Compiled(t *testing.T) {
 	if entry.rateStr != "50" {
 		t.Errorf("rateStr: got %q, want %q", entry.rateStr, "50")
 	}
-	if entry.periodStr != "3600.00" {
-		t.Errorf("periodStr: got %q, want %q", entry.periodStr, "3600.00")
+	if entry.periodStr != "3600" {
+		t.Errorf("periodStr: got %q, want %q", entry.periodStr, "3600")
 	}
 }
 
