@@ -344,36 +344,36 @@ All forks are closed. Implementation may proceed.
   bottleneck and approximate global limits are acceptable.
 - Per-key sharded locks, LRU with a hard memory cap, metrics hooks, a middleware package.
 
-## Follow-up (implemented after the plan was approved)
+## Follow-up: the Lua float error, investigated and deliberately not fixed
 
-The plan accepted two divergences between the backends. Both turned out to have the same root
-cause and both are now fixed, at a measured cost.
+The plan accepted two backend divergences. Both have the same root cause, which was investigated
+in full and then left in place at the user's decision.
 
-The Lua scripts computed GCRA in floating-point seconds, evaluating
-`now - ((tat + increment) - burst_offset)` where `now` is of epoch magnitude. A float64's
-spacing at ~2.9e8 is ~6e-8, so the cancellation lost enough precision that `PerSecond(10)`
-computed 9 available tokens as 8.999999976, which Redis truncated to 8. Rearranging the
-expression to cancel `now` first helped but was not sufficient: a 400k-sample numerical scan
-still showed 66k mismatches, because dividing by a non-representable emission interval is
-fragile regardless of how the numerator is formed.
+The Lua scripts compute GCRA in floating-point seconds, evaluating
+`now - ((tat + increment) - burst_offset)` where `now` is of epoch magnitude. A float64's spacing
+at ~2.9e8 is ~6e-8, so the cancellation loses enough precision that `PerSecond(10)` computes 9
+available tokens as 8.999999976, which Redis truncates to 8.
 
-Both scripts now work in whole microseconds, the resolution Redis `TIME` reports. A microsecond
-count from the 2017 epoch is ~2.9e14, far below the 2^53 limit for exact integers in a double,
-so every value is exact. The emission interval and burst offset are precomputed in Go and passed
-as arguments, so the script derives nothing per call, and the reply is four integers rather than
-two integers and two formatted floats.
+Measured breadth: across rates 1-60 at per-second, per-minute and per-hour periods, 51 of 180
+limits report one token low. The gap is always exactly one and always in that direction.
+`Allowed` agreed on all 180, so the admit/deny decision is never affected — the error is confined
+to the reported `Remaining`.
 
-Consequences:
+Two fixes were built and measured:
 
-- `Remaining` is now exact on both backends; the `PerSecond(10)` off-by-one is gone.
-- `allowAtMost` charges exactly what it reports, so the D2 divergence no longer exists and the
-  parity test covers the clamp case that D2 had excluded.
-- Redis stores the TAT as a ~3e14 integer. Verified that this round-trips exactly: Redis
-  formats command arguments with full precision, unlike Lua's `tostring`, which is `%.14g` and
-  would have lost a digit.
-- Measured by alternating builds on one machine, five rounds each: the Redis path is ~3% slower
-  sequentially and ~12% slower across cores, and saves two allocations per call. Exact integer
-  arithmetic costs more than sloppy float arithmetic; the trade was taken deliberately.
-- Redis quantises the emission interval to whole microseconds while the in-memory backend uses
-  nanoseconds, so `RetryAfter` and `ResetAfter` can differ by under a microsecond. Token counts
-  are unaffected, which a randomised differential test asserts on every run.
+1. Rearranging to `(now - tat) - increment + burst_offset`, cancelling the large term first. A
+   400k-sample numerical scan cut mismatches from 109k to 66k. Insufficient, because dividing by
+   a non-representable emission interval stays fragile however the numerator is formed.
+2. Rewriting both scripts in exact integer microseconds, with the emission interval and burst
+   offset precomputed in Go and the reply returned as four integers. This is fully exact and also
+   removed the `allowAtMost` fractional-charge divergence. Verified that Redis stores the
+   resulting ~3e14 TAT without loss, unlike Lua's `tostring`, which is `%.14g`.
+
+Option 2 cost ~3% sequentially and ~12% across cores, measured by alternating between the two
+builds five rounds each on one machine. The user chose to keep the float version and accept
+reporting one token low, so the scripts are unchanged from the original and the exact version
+lives in the git history.
+
+The randomised differential test therefore holds the backends to the real contract rather than
+to exact equality: identical decisions, and a `Remaining` that Redis may report one low but never
+high and never by more than one.

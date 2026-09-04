@@ -17,13 +17,13 @@ func fmtDur(period time.Duration) string {
 	return period.String()
 }
 
-// dur converts a microsecond count from the script into a Duration, passing
-// through the -1 sentinel the script uses for "no retry needed".
-func dur(microseconds float64) time.Duration {
-	if microseconds == -1 {
+// dur converts a seconds count from the script into a Duration, passing through
+// the -1 sentinel the script uses for "no retry needed".
+func dur(seconds float64) time.Duration {
+	if seconds == -1 {
 		return -1
 	}
-	return time.Duration(microseconds) * time.Microsecond
+	return time.Duration(seconds * float64(time.Second))
 }
 
 func toResult(limit Limit, reply []float64) (*Result, error) {

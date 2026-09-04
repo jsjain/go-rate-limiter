@@ -76,18 +76,10 @@ func newLimitEntry(limit Limit) limitEntry {
 	entry.burstOff = emissionInterval * int64(limit.Burst)
 	entry.burstStr = strconv.Itoa(limit.Burst)
 	entry.rateStr = strconv.Itoa(limit.Rate)
-	// Full precision: 'f', 2 rendered any period under 10ms as "0.00".
+	// Full precision: 'f', 2 rendered any period under 10ms as "0.00", which
+	// made the script divide by zero.
 	entry.periodStr = strconv.FormatFloat(limit.Period.Seconds(), 'f', -1, 64)
-
-	// The script works in whole microseconds, the resolution Redis TIME
-	// reports. A sub-microsecond interval is charged one microsecond.
-	intervalUS := int64(limit.Period/time.Microsecond) / int64(limit.Rate)
-	if intervalUS < 1 {
-		intervalUS = 1
-	}
-	entry.eiStr = strconv.FormatInt(intervalUS, 10)
-	entry.burstOffStr = strconv.FormatInt(intervalUS*int64(limit.Burst), 10)
-	entry.args1 = []string{entry.eiStr, entry.burstOffStr, "1"}
+	entry.args1 = []string{entry.burstStr, entry.rateStr, entry.periodStr, "1"}
 	return entry
 }
 
@@ -97,7 +89,7 @@ func (entry limitEntry) argv(n int) []string {
 	if n == 1 {
 		return entry.args1
 	}
-	return []string{entry.eiStr, entry.burstOffStr, strconv.Itoa(n)}
+	return []string{entry.burstStr, entry.rateStr, entry.periodStr, strconv.Itoa(n)}
 }
 
 //------------------------------------------------------------------------------

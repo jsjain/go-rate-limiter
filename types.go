@@ -33,11 +33,6 @@ type limitEntry struct {
 	// copies args into its own command buffer, so sharing it is safe.
 	args1 []string
 
-	// The script's arguments, in whole microseconds. Derived here rather than
-	// in Lua so the script does no arithmetic per call.
-	eiStr       string
-	burstOffStr string
-
 	ei       int64 // emission interval, nanoseconds per event
 	burstOff int64 // ei * Burst
 }
