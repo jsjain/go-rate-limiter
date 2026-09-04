@@ -2,6 +2,7 @@ package rate_limiter
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -577,11 +578,84 @@ func TestKnownDivergence_RedisFloatLosesAToken(t *testing.T) {
 		t.Errorf("in-memory Remaining: got %d, want the exact 9", mr.Remaining)
 	}
 	if rr.Remaining != 8 {
-		t.Logf("Redis now reports Remaining=%d (was 8 due to float truncation); "+
-			"if this reads 9 the Lua script has been made exact and this test can go",
-			rr.Remaining)
+		t.Errorf("Redis Remaining: got %d, want 8. If this now reads 9 the float "+
+			"truncation is gone, the backends agree, and this test plus the README "+
+			"note should be deleted. Any other value means the drift changed and the "+
+			"documented divergence is wrong.", rr.Remaining)
 	}
 	if rr.Allowed != mr.Allowed {
 		t.Errorf("admit/deny must not diverge: redis=%d mem=%d", rr.Allowed, mr.Allowed)
+	}
+}
+
+// AllowAtMost's explicit limit argument wins over a per-key custom limit. This
+// is what the original code did, so preserving it keeps existing callers'
+// behaviour unchanged; AllowAtMostN is the variant that resolves custom limits.
+func TestAllowAtMost_ExplicitLimitBeatsCustomLimit(t *testing.T) {
+	ctx := context.Background()
+	key := "atmost:explicit"
+	l, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
+	l.SetCustomLimit(key, PerSecond(3))
+
+	explicit := PerSecond(9)
+	res, err := l.AllowAtMost(ctx, key, explicit, 9)
+	if err != nil {
+		t.Fatalf("AllowAtMost: %v", err)
+	}
+	if res.Limit != explicit {
+		t.Errorf("AllowAtMost must use the explicit limit, got %v want %v", res.Limit, explicit)
+	}
+	if res.Allowed != 9 {
+		t.Errorf("expected the explicit burst of 9 to be admitted, got %d", res.Allowed)
+	}
+
+	// AllowAtMostN on the same key resolves the custom limit of 3/s instead.
+	l2, _ := newFakeLimiter(t, WithRateLimit(PerSecond(2)))
+	l2.SetCustomLimit(key, PerSecond(3))
+	res, err = l2.AllowAtMostN(ctx, key, 9)
+	if err != nil {
+		t.Fatalf("AllowAtMostN: %v", err)
+	}
+	if res.Limit != PerSecond(3) {
+		t.Errorf("AllowAtMostN must resolve the custom limit, got %v", res.Limit)
+	}
+	if res.Allowed != 3 {
+		t.Errorf("expected a clamp to the custom burst of 3, got %d", res.Allowed)
+	}
+}
+
+// WithSweepInterval(0) must start no goroutine. Every deterministic test in
+// this file depends on it: if a sweeper were running against the real clock
+// while a test drove a fake one, those tests would fail as intermittent flakes
+// rather than as an obvious regression.
+func TestWithSweepInterval_ZeroStartsNoGoroutine(t *testing.T) {
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	limiters := make([]*Limiter, 20)
+	for i := range limiters {
+		limiters[i] = NewInMemoryLimiter(WithSweepInterval(0))
+	}
+	if got := runtime.NumGoroutine(); got > before {
+		t.Errorf("WithSweepInterval(0) started %d goroutine(s); want none", got-before)
+	}
+	for _, l := range limiters {
+		if err := l.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+
+	// Sweeping still works when driven by hand.
+	l := NewInMemoryLimiter(WithSweepInterval(0), WithRateLimit(PerSecond(1)))
+	defer l.Close()
+	b := memOf(t, l)
+	clock := &fakeClock{}
+	clock.ns.Store(int64(time.Hour))
+	b.now = clock.ns.Load
+
+	l.Allow(context.Background(), "manual")
+	clock.advance(2 * time.Second)
+	if got := b.sweep(); got != 1 {
+		t.Errorf("manual sweep reclaimed %d keys, want 1", got)
 	}
 }
